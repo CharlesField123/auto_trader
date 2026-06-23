@@ -1,0 +1,9 @@
+[build]
+builder = "dockerfile"
+
+[deploy]
+# 13:30 UTC = 9:30 AM EDT (Apr–Oct). The Alpaca market calendar check at
+# runtime handles EST/DST drift and market holidays automatically, so on
+# winter days the job simply exits early when the market is not yet open.
+cronSchedule = "30 13 * * 1-5"
+restartPolicyType = "never"
