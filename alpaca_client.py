@@ -103,7 +103,7 @@ class AlpacaClient:
             symbol=plan.ticker,
             qty=plan.qty,
             side=OrderSide.BUY if plan.side == "buy" else OrderSide.SELL,
-            time_in_force=TimeInForce.DAY,
+            time_in_force=TimeInForce.GTC,
             order_class=OrderClass.BRACKET,
             limit_price=plan.entry,
             take_profit=TakeProfitRequest(limit_price=plan.take_profit),
