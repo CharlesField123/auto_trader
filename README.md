@@ -6,9 +6,10 @@ execution → Discord flow:
 - **Daily stock bot** (`python main.py`) — every market day at 9:30 AM ET it
   reads today's signals from the Supabase `signals` table, applies risk
   management, and places **paper** bracket orders via Alpaca.
-- **Futures scanner** (`python main.py --futures`) — a long-running worker that
-  **scans a futures universe every 60 seconds (1-minute bars)**, ranks symbols
-  to find the **best** opportunities right now, and trades them automatically.
+- **Futures scanner** (`python main.py --futures`) — a long-running **24/5**
+  worker that **scans a futures universe every 60 seconds (1-minute bars)** all
+  day Monday–Friday, ranks symbols to find the **best** opportunities right now,
+  and trades them automatically.
 
 ## Files
 
@@ -44,6 +45,12 @@ take-profit. They flow through the **same** risk manager and Alpaca bracket-orde
 path as the stock bot; symbols already held are skipped so the loop doesn't
 stack entries every minute. Notifications are identical: one 🚀 session start, a
 ✅/⚠️ per candidate, 🔴 on circuit breaker, and a 🏁 session-end summary.
+
+**24/5 operation:** the worker stays alive continuously and scans around the
+clock Monday–Friday (ET), idling over the weekend. It rolls a fresh session at
+each ET day boundary — emitting a 🏁 summary for the day that's ending and a 🚀
+start for the new one — and the daily circuit breaker resets each session, so
+tripping it pauses new entries only until the next trading day.
 
 > [!NOTE]
 > Alpaca's standard feed serves equities/crypto, so `FUTURES_UNIVERSE` defaults

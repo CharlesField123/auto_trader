@@ -3,13 +3,14 @@
 Two modes, both sharing one risk → execution → Discord pipeline:
 
     python main.py                  # daily one-shot: trade today's StockAI signals
-    python main.py --futures        # continuous: scan futures every 60s, trade best
+    python main.py --futures        # 24/5: scan futures every 60s, trade best
     python main.py --dry-run        # size signals only; no orders, no Discord
     python main.py --futures --dry-run --max-cycles 1   # one offline scan cycle
 
 Daily mode runs once and exits 0 (the original cron behavior). Futures mode
-stays alive and rescans on a fixed interval until the market closes, the circuit
-breaker trips, or the process is interrupted.
+stays alive and rescans on a fixed interval around the clock, Monday–Friday —
+rolling a fresh session (and circuit-breaker baseline) each trading day and
+idling over the weekend, until the process is interrupted.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from datetime import datetime
 
 # Load .env before any project module reads os.environ — risk_manager resolves
 # its thresholds at import time, so this must run first.
@@ -26,7 +28,7 @@ load_dotenv()
 
 import futures_scanner  # noqa: E402 — must import after load_dotenv()
 import risk_manager  # noqa: E402 — must import after load_dotenv()
-from alpaca_client import AlpacaClient  # noqa: E402
+from alpaca_client import ET, AlpacaClient  # noqa: E402
 from discord_notifier import DiscordNotifier  # noqa: E402
 from logger import log  # noqa: E402
 from supabase_client import fetch_signals  # noqa: E402
@@ -60,7 +62,7 @@ def parse_args() -> argparse.Namespace:
         "--max-cycles",
         type=int,
         default=0,
-        help="Stop the futures scanner after N cycles (0 = run until market close).",
+        help="Stop the futures scanner after N cycles (0 = run continuously, 24/5).",
     )
     return parser.parse_args()
 
@@ -178,91 +180,123 @@ def run(dry_run: bool, force_market_open: bool = False) -> int:
     return 0
 
 
+def _is_trading_day(now: datetime) -> bool:
+    """True Monday–Friday in US/Eastern — the 24/5 futures window.
+
+    ``weekday()`` is 0=Mon … 6=Sun, so <5 keeps Mon–Fri and idles the weekend.
+    Futures trade nearly around the clock on weekdays, so we gate on the day,
+    not on equity-market hours.
+    """
+    return now.weekday() < 5
+
+
+WEEKEND_POLL_SECONDS = 300  # how often to re-check for the week to reopen
+
+
 def run_scan_loop(
     dry_run: bool,
     interval: int,
     force_market_open: bool = False,
     max_cycles: int = 0,
 ) -> int:
-    """Continuously scan futures every ``interval`` seconds and trade the best.
+    """Scan futures 24/5 — every ``interval`` seconds, all day Monday–Friday.
 
-    Emits the same Discord flow as the daily run: one 🚀 session-start when the
-    loop begins, a ✅/⚠️ per signal each cycle, 🔴 if the circuit breaker trips,
-    and a 🏁 session-end summary on shutdown. Exits when the market closes, the
-    breaker halts trading, ``max_cycles`` is reached, or it is interrupted.
+    Stays alive continuously: it rolls a fresh trading session at each ET day
+    boundary and idles over the weekend, then resumes. Each session emits the
+    same Discord flow as the original daily run — one 🚀 session-start, a ✅/⚠️
+    per signal, 🔴 if that day's circuit breaker trips, and a 🏁 session-end
+    summary when the day rolls over (or the weekend / shutdown arrives).
+
+    The circuit breaker is per-day: its equity baseline resets each session, and
+    tripping it pauses new entries only until the next trading day.
     """
     notifier = DiscordNotifier(enabled=not dry_run)
     alpaca = AlpacaClient()
 
-    # Gate on market hours up front, mirroring the daily run.
-    if dry_run:
-        log.info("[DRY RUN] Skipping market-open gate.")
-    elif force_market_open:
-        log.warning("[FORCE] Bypassing market-open gate — orders may queue until open.")
-    elif not alpaca.is_market_open_today():
-        log.info("Market is closed today — futures scanner exiting silently.")
-        return 0
-
-    # Session baseline for the daily circuit breaker (down X% on the day).
-    starting_equity = alpaca.get_equity()
     log.info(
-        "Futures scanner live — equity $%.2f, interval %ds, universe %s",
-        starting_equity, interval, ", ".join(futures_scanner.FUTURES_UNIVERSE),
+        "Futures scanner live (24/5) — interval %ds, universe %s",
+        interval, ", ".join(futures_scanner.FUTURES_UNIVERSE),
     )
 
-    total_trades = 0
-    halted = False
-    started = False
+    # Per-session state. ``session_date`` is None whenever no session is open.
+    session_date = None
+    day_baseline = 0.0       # equity at session start (daily circuit breaker)
+    day_trades = 0
+    halted_today = False
     cycle = 0
+
+    def end_session() -> None:
+        nonlocal session_date, day_trades
+        if session_date is None:
+            return
+        final_equity = day_baseline if dry_run else alpaca.get_equity()
+        net_pnl = final_equity - day_baseline
+        log.info(
+            "Session %s complete — trades=%d  net_pnl=$%.2f  equity=$%.2f",
+            session_date, day_trades, net_pnl, final_equity,
+        )
+        notifier.session_end(day_trades, net_pnl, final_equity)
+        session_date = None
 
     try:
         while True:
             cycle += 1
+            now = datetime.now(ET)
+            trading = dry_run or force_market_open or _is_trading_day(now)
 
-            # Stop cleanly when the market closes mid-session.
-            if not dry_run and not force_market_open and not alpaca.is_market_open_today():
-                log.info("Market closed — ending futures scan session.")
-                break
+            # Weekend (or outside window): close any open session and idle.
+            if not trading:
+                end_session()
+                if max_cycles and cycle >= max_cycles:
+                    break
+                log.info("Outside 24/5 window (%s) — idling.", now.strftime("%a %H:%M ET"))
+                time.sleep(WEEKEND_POLL_SECONDS)
+                continue
+
+            # Roll the session at each ET day boundary: close yesterday's,
+            # reset the daily circuit-breaker baseline, open today's.
+            today = now.date()
+            first_scan = session_date != today
+            if first_scan:
+                end_session()
+                session_date = today
+                day_baseline = alpaca.get_equity()
+                day_trades = 0
+                halted_today = False
+                log.info("New trading session %s — baseline equity $%.2f", today, day_baseline)
+
+            # Breaker tripped earlier today: hold new entries until tomorrow.
+            if halted_today:
+                if max_cycles and cycle >= max_cycles:
+                    break
+                time.sleep(interval)
+                continue
 
             # Skip symbols we already hold so we don't stack entries each minute.
             held = alpaca.get_open_symbols()
             signals = futures_scanner.scan(alpaca, exclude=held)
 
-            # One session-start, on the first cycle, like the original run.
-            if not started:
+            if first_scan:
                 notifier.session_start(len(signals), [s.ticker for s in signals])
-                started = True
 
             for signal in signals:
-                placed, halted = _process_signal(
+                placed, halted_today = _process_signal(
                     signal, alpaca, notifier,
-                    dry_run=dry_run, starting_equity=starting_equity, halted=halted,
+                    dry_run=dry_run, starting_equity=day_baseline, halted=halted_today,
                 )
                 if placed:
-                    total_trades += 1
+                    day_trades += 1
+            if halted_today:
+                log.warning("Circuit breaker tripped — pausing new entries until next session.")
 
-            if halted:
-                log.warning("Circuit breaker active — halting scan loop.")
-                break
             if max_cycles and cycle >= max_cycles:
-                log.info("Reached max cycles (%d) — stopping.", max_cycles)
                 break
-
             time.sleep(interval)
     except KeyboardInterrupt:
         log.info("Interrupted — shutting down futures scanner.")
 
-    # Safety net: announce a start even if the loop broke before its first cycle.
-    if not started:
-        notifier.session_start(0, [])
-
-    final_equity = starting_equity if dry_run else alpaca.get_equity()
-    net_pnl = final_equity - starting_equity
-    log.info(
-        "Scanner done. cycles=%d  trades=%d  net_pnl=$%.2f  final_equity=$%.2f",
-        cycle, total_trades, net_pnl, final_equity,
-    )
-    notifier.session_end(total_trades, net_pnl, final_equity)
+    end_session()
+    log.info("Scanner stopped after %d cycle(s).", cycle)
     return 0
 
 
