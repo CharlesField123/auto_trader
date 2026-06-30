@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytz
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestTradeRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
+from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
 from alpaca.trading.requests import (
@@ -41,6 +42,17 @@ class PlacedOrder:
     side: str
     qty: int
     status: str
+
+
+@dataclass
+class Bar:
+    """A single OHLCV candle, normalized for the scanner."""
+
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
 
 
 class AlpacaClient:
@@ -95,6 +107,54 @@ class AlpacaClient:
         except Exception as exc:  # noqa: BLE001 — surface, don't crash the run
             log.warning("Could not fetch price for %s: %s", ticker, exc)
             return None
+
+    # ------------------------------------------------------------------ scanning
+    def get_minute_bars(self, symbol: str, limit: int = 20) -> list[Bar]:
+        """Most recent ``limit`` one-minute OHLCV bars for ``symbol``.
+
+        Returns an empty list (rather than raising) when the symbol has no data
+        or is not available on the configured feed, so the scanner can simply
+        skip it and keep moving across the rest of the universe.
+        """
+        try:
+            # Pull a generous window so we still get ``limit`` bars even with
+            # gaps (low-volume minutes, halts). Newest bars are kept below.
+            end = datetime.now(ET)
+            start = end - timedelta(minutes=limit * 3 + 15)
+            request = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame.Minute,
+                start=start,
+                end=end,
+            )
+            barset = self.data.get_stock_bars(request)
+            raw = barset.data.get(symbol, []) if hasattr(barset, "data") else []
+            bars = [
+                Bar(
+                    open=float(b.open),
+                    high=float(b.high),
+                    low=float(b.low),
+                    close=float(b.close),
+                    volume=float(b.volume),
+                )
+                for b in raw
+            ]
+            return bars[-limit:]
+        except Exception as exc:  # noqa: BLE001 — skip this symbol, not the scan
+            log.warning("Could not fetch bars for %s: %s", symbol, exc)
+            return []
+
+    def get_open_symbols(self) -> set[str]:
+        """Set of symbols the account currently holds an open position in.
+
+        Used by the scanning loop to avoid stacking a fresh entry on a symbol
+        we are already in.
+        """
+        try:
+            return {str(p.symbol).upper() for p in self.trading.get_all_positions()}
+        except Exception as exc:  # noqa: BLE001 — treat as "unknown, hold nothing"
+            log.warning("Could not list open positions: %s", exc)
+            return set()
 
     # ------------------------------------------------------------------ orders
     def submit_bracket_order(self, plan: TradePlan) -> PlacedOrder:
