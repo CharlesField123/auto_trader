@@ -44,7 +44,7 @@ MIN_PRICE = _env_float("MIN_PRICE", 0.01)
 MAX_OPEN_POSITIONS = _env_int("MAX_OPEN_POSITIONS", 5)           # diversification cap
 MAX_GROSS_EXPOSURE_PCT = _env_float("MAX_GROSS_EXPOSURE_PCT", 0.50)  # ≤50% deployed
 MAX_POSITION_PCT = _env_float("MAX_POSITION_PCT", 0.10)         # ≤10% equity/position
-MIN_NOTIONAL = _env_float("MIN_NOTIONAL", 1.0)                   # Alpaca crypto min $1
+MIN_NOTIONAL = _env_float("MIN_NOTIONAL", 10.0)                   # Alpaca crypto min $1
 
 
 @dataclass
