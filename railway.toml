@@ -2,12 +2,12 @@
 builder = "dockerfile"
 
 [deploy]
-# Futures scanner runs as a long-lived worker, rescanning every 60s (1-minute
-# bars) while the market is open. The Alpaca calendar check inside the loop ends
-# the session cleanly at the close and exits silently on holidays/weekends, so
-# the worker can simply be restarted each day.
-startCommand = "python main.py --futures"
-restartPolicyType = "on_failure"
+# Crypto scanner runs as a long-lived 24/5 worker, rescanning every 60s
+# (1-minute bars) around the clock Monday–Friday (crypto is Alpaca's only 24/7
+# asset class). It rolls a fresh session each ET trading day and idles over the
+# weekend, so it stays up across the week; "always" restarts it on a crash.
+startCommand = "python main.py --crypto"
+restartPolicyType = "always"
 restartPolicyMaxRetries = 10
 
 # To run the original once-a-day StockAI stock bot instead, delete startCommand
