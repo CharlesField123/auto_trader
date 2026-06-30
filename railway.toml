@@ -2,8 +2,14 @@
 builder = "dockerfile"
 
 [deploy]
-# 13:30 UTC = 9:30 AM EDT (Apr–Oct). The Alpaca market calendar check at
-# runtime handles EST/DST drift and market holidays automatically, so on
-# winter days the job simply exits early when the market is not yet open.
-cronSchedule = "30 13 * * 1-5"
-restartPolicyType = "never"
+# Futures scanner runs as a long-lived worker, rescanning every 60s (1-minute
+# bars) while the market is open. The Alpaca calendar check inside the loop ends
+# the session cleanly at the close and exits silently on holidays/weekends, so
+# the worker can simply be restarted each day.
+startCommand = "python main.py --futures"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+
+# To run the original once-a-day StockAI stock bot instead, delete startCommand
+# above and restore the cron:
+#   cronSchedule = "30 13 * * 1-5"   # 13:30 UTC = 9:30 AM EDT, Mon–Fri

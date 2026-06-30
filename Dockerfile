@@ -14,5 +14,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the application source.
 COPY . .
 
-# Cron triggers this once per market day; the script runs and exits.
-CMD ["python", "main.py"]
+# Default to the continuous futures scanner (1-minute interval). Railway's
+# startCommand can override this; run `python main.py` for the daily stock bot.
+CMD ["python", "main.py", "--futures"]
