@@ -28,9 +28,15 @@ from alpaca.data.requests import (
 )
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
+from alpaca.trading.enums import (
+    OrderClass,
+    OrderSide,
+    QueryOrderStatus,
+    TimeInForce,
+)
 from alpaca.trading.requests import (
     GetCalendarRequest,
+    GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
     StopLossRequest,
@@ -78,6 +84,11 @@ class Position:
     qty: float
     market_value: float    # absolute dollar value of the position
     unrealized_plpc: float  # unrealized P&L as a fraction, e.g. 0.025 = +2.5%
+    asset_class: str       # "crypto", "us_equity", … — what kind of position
+
+    @property
+    def is_crypto(self) -> bool:
+        return self.asset_class == "crypto"
 
 
 @dataclass
@@ -134,7 +145,7 @@ class AlpacaClient:
         return float(account.equity)
 
     def get_positions(self) -> list[Position]:
-        """Normalized open positions (symbol, qty, value, unrealized P&L%)."""
+        """Normalized open positions (symbol, qty, value, P&L%, asset class)."""
         try:
             return [
                 Position(
@@ -142,6 +153,9 @@ class AlpacaClient:
                     qty=float(p.qty),
                     market_value=abs(float(p.market_value)),
                     unrealized_plpc=float(p.unrealized_plpc),
+                    asset_class=str(
+                        getattr(p.asset_class, "value", p.asset_class)
+                    ).lower(),
                 )
                 for p in self.trading.get_all_positions()
             ]
@@ -149,10 +163,19 @@ class AlpacaClient:
             log.warning("Could not list open positions: %s", exc)
             return []
 
+    def get_crypto_positions(self) -> list[Position]:
+        """Open crypto positions only — the sleeve this bot manages."""
+        return [p for p in self.get_positions() if p.is_crypto]
+
     def get_account_state(self) -> AccountState:
-        """Equity, available cash, and current exposure for portfolio risk gates."""
+        """Equity, available cash, and crypto exposure for portfolio risk gates.
+
+        Position count and gross exposure are scoped to the bot's own crypto
+        sleeve so unrelated equity holdings in the account don't consume its
+        risk budget or trip its caps.
+        """
         account = self.trading.get_account()
-        positions = self.get_positions()
+        crypto = self.get_crypto_positions()
         # Crypto is non-marginable, so cash (not margin buying power) is the cap.
         cash = float(
             getattr(account, "non_marginable_buying_power", None) or account.cash
@@ -160,8 +183,8 @@ class AlpacaClient:
         return AccountState(
             equity=float(account.equity),
             cash=cash,
-            open_positions=len(positions),
-            gross_exposure=sum(p.market_value for p in positions),
+            open_positions=len(crypto),
+            gross_exposure=sum(p.market_value for p in crypto),
         )
 
     # ------------------------------------------------------------------ pricing
@@ -284,9 +307,39 @@ class AlpacaClient:
             status=str(order.status),
         )
 
+    def cancel_open_orders_for(self, symbol: str) -> None:
+        """Cancel any open orders on ``symbol`` (frees qty held_for_orders)."""
+        target = normalize_symbol(symbol)
+        try:
+            orders = self.trading.get_orders(
+                filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+            log.warning("Could not list open orders for %s: %s", symbol, exc)
+            return
+        for order in orders:
+            if normalize_symbol(str(order.symbol)) == target:
+                try:
+                    self.trading.cancel_order_by_id(order.id)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("Cancel failed for order %s: %s", order.id, exc)
+
     def close_position(self, symbol: str) -> None:
-        """Liquidate the full position in ``symbol`` with a market order."""
-        self.trading.close_position(symbol)
+        """Liquidate the full position in ``symbol`` with a market order.
+
+        If the position's quantity is locked by resting orders (Alpaca returns
+        an "insufficient qty available / held_for_orders" error), cancel those
+        orders and retry once so the close can go through.
+        """
+        try:
+            self.trading.close_position(symbol)
+        except Exception as exc:  # noqa: BLE001 — recover from held-for-orders
+            log.info(
+                "Close of %s blocked (%s) — cancelling open orders and retrying.",
+                symbol, exc,
+            )
+            self.cancel_open_orders_for(symbol)
+            self.trading.close_position(symbol)
 
     def submit_bracket_order(self, plan: TradePlan) -> PlacedOrder:
         """Submit an atomic bracket order (entry + TP + SL)."""

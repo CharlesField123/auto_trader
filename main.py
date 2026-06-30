@@ -215,11 +215,13 @@ def _manage_exits(
     """Close any open position whose unrealized P&L hit its stop or target.
 
     This is how stop-loss / take-profit are enforced for crypto, which has no
-    bracket/OCO orders on Alpaca. Each closed symbol is stamped into ``cooldown``
-    so the scanner won't immediately re-enter it. Returns the number closed.
+    bracket/OCO orders on Alpaca. Only the bot's own crypto positions are
+    managed — unrelated equity holdings in the account are left untouched. Each
+    closed symbol is stamped into ``cooldown`` so the scanner won't immediately
+    re-enter it. Returns the number closed.
     """
     closed = 0
-    for pos in alpaca.get_positions():
+    for pos in alpaca.get_crypto_positions():
         plpc = pos.unrealized_plpc
         if plpc >= take_profit_pct:
             reason = f"take-profit hit (+{plpc:.2%})"
