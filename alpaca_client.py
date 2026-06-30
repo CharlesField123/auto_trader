@@ -285,16 +285,23 @@ class AlpacaClient:
         return {p.symbol for p in self.get_positions()}
 
     # ------------------------------------------------------------------ orders
-    def submit_crypto_buy(self, plan: TradePlan) -> PlacedOrder:
-        """Submit a crypto market buy.
+    # Alpaca caps a single crypto order at $200k notional.
+    MAX_CRYPTO_NOTIONAL = 200_000.0
 
-        Alpaca crypto supports neither bracket/OCO nor short selling, so this is
-        a plain long entry; the take-profit and stop-loss are enforced by the
-        scan loop closing the position when P&L crosses the configured levels.
+    def submit_crypto_buy(self, plan: TradePlan) -> PlacedOrder:
+        """Submit a crypto market buy by **notional** dollar amount.
+
+        Buying by notional (rather than quantity) is the reliable way to acquire
+        fractional crypto on Alpaca — the venue computes the fractional units, so
+        no whole-unit rounding ever happens. Alpaca crypto supports neither
+        bracket/OCO nor short selling, so this is a plain long entry; the
+        take-profit and stop-loss are enforced by the scan loop closing the
+        position when P&L crosses the configured levels.
         """
+        notional = round(min(plan.qty * plan.entry, self.MAX_CRYPTO_NOTIONAL), 2)
         order_request = MarketOrderRequest(
             symbol=plan.ticker,
-            qty=plan.qty,
+            notional=notional,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.GTC,
         )

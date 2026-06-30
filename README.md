@@ -65,7 +65,8 @@ Layered so no single signal can over-deploy or blow up the account:
 | Per-position notional cap | 10% of equity | `MAX_POSITION_PCT` |
 | Max concurrent positions | 5 | `MAX_OPEN_POSITIONS` |
 | Gross-exposure ceiling | 50% of equity | `MAX_GROSS_EXPOSURE_PCT` |
-| Buying-power + min-notional checks | live cash / $1 | `MIN_NOTIONAL` |
+| Size to available buying power | order scaled to fit live cash (×0.98) | — |
+| Min-notional floor | skip below $1 | `MIN_NOTIONAL` |
 | Daily circuit breaker | halt new entries at −3%/day | `DAILY_DRAWDOWN_HALT_PCT` |
 | Stop-loss / take-profit | −1% / +2% | `CRYPTO_STOP_LOSS_PCT` / `CRYPTO_TAKE_PROFIT_PCT` |
 | Re-entry cooldown | 15 min after a close | `REENTRY_COOLDOWN_MIN` |

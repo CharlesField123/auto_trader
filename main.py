@@ -161,8 +161,13 @@ def _enter_crypto(
         notifier.trade_skipped(signal.ticker, "No price available on Alpaca.")
         return False, halted, 0.0
 
+    # Cap the order to available buying power (keep a small buffer for fees /
+    # price drift) so it buys an affordable fractional amount instead of asking
+    # for more cash than the account holds.
+    affordable_notional = max(portfolio.cash * CASH_BUFFER, 0.0)
     decision = risk_manager.evaluate(
-        signal, price, day_baseline, fractional=True, price_precision=6
+        signal, price, day_baseline,
+        fractional=True, price_precision=6, max_notional=affordable_notional,
     )
     if not decision.approved:
         log.info("Skipping %s — %s", signal.ticker, decision.reason)
@@ -306,6 +311,7 @@ def _is_trading_day(now: datetime) -> bool:
 
 WEEKEND_POLL_SECONDS = 300  # how often to re-check for the week to reopen
 REENTRY_COOLDOWN_MIN = risk_manager._env_int("REENTRY_COOLDOWN_MIN", 15)
+CASH_BUFFER = 0.98          # fraction of buying power an order may use (fees/slip)
 
 
 def run_scan_loop(

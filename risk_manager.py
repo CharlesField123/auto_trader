@@ -130,12 +130,16 @@ def evaluate(
     *,
     fractional: bool = False,
     price_precision: int = 2,
+    max_notional: Optional[float] = None,
 ) -> RiskDecision:
     """Build a :class:`TradePlan` for ``signal`` or reject it with a reason.
 
     ``fractional`` allows sub-unit quantities (crypto), where a single unit can
     cost far more than the per-trade risk budget. ``price_precision`` controls
     rounding of derived prices (2 decimals for equities, more for crypto pairs).
+    ``max_notional`` caps the position's dollar size to what the account can
+    actually afford (available buying power) — so a fractional order is sized
+    down to fit rather than rejected outright.
     """
 
     if entry_price < MIN_PRICE:
@@ -175,10 +179,17 @@ def evaluate(
     if per_share_risk <= 0:
         return RiskDecision(approved=False, reason="Zero per-share risk")
 
-    # Cap each position's notional so a tight stop can't size up to the whole
-    # account (notional = risk$ ÷ stop%, which explodes as the stop tightens).
-    notional_cap_qty = (equity * MAX_POSITION_PCT) / entry_price
-    raw_qty = min(risk_budget / per_share_risk, notional_cap_qty)
+    # Size to the smallest of: risk-based qty, the per-position equity ceiling
+    # (a tight stop can't size up to the whole account, since notional =
+    # risk$ ÷ stop%), and available buying power so we never order more than the
+    # account can afford — the order is scaled down to fit, not rejected.
+    caps = [
+        risk_budget / per_share_risk,
+        (equity * MAX_POSITION_PCT) / entry_price,
+    ]
+    if max_notional is not None:
+        caps.append(max_notional / entry_price)
+    raw_qty = min(caps)
     qty = round(raw_qty, 6) if fractional else float(int(raw_qty))
     if qty <= 0:
         return RiskDecision(
