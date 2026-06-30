@@ -36,7 +36,15 @@ execution → Discord flow:
 python main.py --crypto                              # live, rescans every 60s
 python main.py --crypto --dry-run --max-cycles 1     # one offline scan, no orders
 python main.py --crypto --interval 30                # custom cadence (seconds)
+python main.py --flatten-equities                    # liquidate leftover stocks, free buying power
+python main.py --flatten-equities --dry-run          # preview what would be flattened
 ```
+
+> [!TIP]
+> `--flatten-equities` is a one-shot cleanup: it cancels stale **equity** orders
+> and liquidates all non-crypto positions so they stop tying up buying power the
+> crypto scanner needs. Crypto positions are never touched. Run it once if a
+> prior stock/ETF run left holdings in the account.
 
 Each cycle pulls the last `SCAN_LOOKBACK_BARS` one-minute bars for every pair in
 `CRYPTO_UNIVERSE` and scores them:

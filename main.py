@@ -72,6 +72,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Stop the scanner after N cycles (0 = run continuously, 24/5).",
     )
+    parser.add_argument(
+        "--flatten-equities",
+        action="store_true",
+        help="One-shot maintenance: cancel stale equity orders and liquidate all "
+        "non-crypto positions to free up buying power, then exit. Never touches crypto.",
+    )
     return parser.parse_args()
 
 
@@ -451,10 +457,49 @@ def run_scan_loop(
     return 0
 
 
+def run_flatten_equities(dry_run: bool) -> int:
+    """Cancel stale equity orders and liquidate all non-crypto positions.
+
+    A one-shot cleanup so leftover equity holdings (and their resting orders)
+    stop tying up buying power the crypto scanner needs. Crypto is never touched.
+    """
+    alpaca = AlpacaClient()
+    equities = [p for p in alpaca.get_positions() if not p.is_crypto]
+
+    if not equities:
+        log.info("No equity positions to flatten.")
+        return 0
+
+    log.info(
+        "Found %d equity position(s): %s",
+        len(equities), ", ".join(f"{p.symbol}(${p.market_value:,.0f})" for p in equities),
+    )
+    if dry_run:
+        log.info("[DRY RUN] Would cancel equity orders and liquidate the above; no action taken.")
+        return 0
+
+    cancelled = alpaca.cancel_non_crypto_orders()
+    log.info("Cancelled %d open equity order(s).", cancelled)
+
+    closed = 0
+    for pos in equities:
+        try:
+            alpaca.close_position(pos.symbol)
+            closed += 1
+            log.info("Flattened %s (qty=%g, ~$%.2f).", pos.symbol, pos.qty, pos.market_value)
+        except Exception as exc:  # noqa: BLE001 — keep going on the rest
+            log.error("Could not flatten %s: %s", pos.symbol, exc)
+
+    log.info("Flatten complete — closed %d/%d equity position(s).", closed, len(equities))
+    return 0
+
+
 def main() -> None:
     args = parse_args()
     try:
-        if args.crypto:
+        if args.flatten_equities:
+            exit_code = run_flatten_equities(dry_run=args.dry_run)
+        elif args.crypto:
             exit_code = run_scan_loop(
                 dry_run=args.dry_run,
                 interval=args.interval,

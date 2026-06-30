@@ -314,6 +314,30 @@ class AlpacaClient:
             status=str(order.status),
         )
 
+    def cancel_non_crypto_orders(self) -> int:
+        """Cancel every open non-crypto order; returns how many were cancelled.
+
+        Crypto order symbols carry a slash ("BTC/USD"); equity/option symbols do
+        not, so that's how we leave the bot's own crypto orders untouched.
+        """
+        try:
+            orders = self.trading.get_orders(
+                filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+            log.warning("Could not list open orders: %s", exc)
+            return 0
+        cancelled = 0
+        for order in orders:
+            if "/" in str(order.symbol):  # crypto — leave it alone
+                continue
+            try:
+                self.trading.cancel_order_by_id(order.id)
+                cancelled += 1
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Cancel failed for order %s: %s", order.id, exc)
+        return cancelled
+
     def cancel_open_orders_for(self, symbol: str) -> None:
         """Cancel any open orders on ``symbol`` (frees qty held_for_orders)."""
         target = normalize_symbol(symbol)
