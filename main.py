@@ -318,6 +318,7 @@ def _is_trading_day(now: datetime) -> bool:
 WEEKEND_POLL_SECONDS = 300  # how often to re-check for the week to reopen
 REENTRY_COOLDOWN_MIN = risk_manager._env_int("REENTRY_COOLDOWN_MIN", 15)
 CASH_BUFFER = 0.98          # fraction of buying power an order may use (fees/slip)
+STATUS_UPDATE_MIN = risk_manager._env_int("STATUS_UPDATE_MIN", 60)  # P&L heartbeat cadence
 
 
 def run_scan_loop(
@@ -354,6 +355,7 @@ def run_scan_loop(
     halted_today = False
     cycle = 0
     cooldown: dict[str, datetime] = {}  # symbol → last-exit time (re-entry guard)
+    last_status_ts = 0.0     # last time a P&L heartbeat was posted (epoch seconds)
 
     def end_session() -> None:
         nonlocal session_date, day_trades
@@ -402,6 +404,20 @@ def run_scan_loop(
                 stop_pct=crypto_scanner.CRYPTO_STOP_LOSS_PCT,
                 take_profit_pct=crypto_scanner.CRYPTO_TAKE_PROFIT_PCT,
             )
+
+            # Periodic P&L heartbeat: total account size, buying power, day P&L.
+            if now.timestamp() - last_status_ts >= STATUS_UPDATE_MIN * 60:
+                acct = alpaca.get_account_state()
+                day_pnl = acct.equity - day_baseline
+                day_pnl_pct = day_pnl / day_baseline if day_baseline else 0.0
+                log.info(
+                    "Status — equity $%.2f  cash $%.2f  day P&L $%.2f (%.2f%%)  positions %d",
+                    acct.equity, acct.cash, day_pnl, day_pnl_pct * 100, acct.open_positions,
+                )
+                notifier.portfolio_update(
+                    acct.equity, acct.cash, day_pnl, day_pnl_pct, acct.open_positions
+                )
+                last_status_ts = now.timestamp()
 
             # Breaker tripped earlier today: hold new entries until tomorrow
             # (exits above still run so open risk keeps winding down).

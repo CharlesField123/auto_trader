@@ -21,6 +21,7 @@ COLOR_GREEN = 0x2ECC71    # Trade placed
 COLOR_YELLOW = 0xF1C40F   # Trade skipped
 COLOR_RED = 0xE74C3C      # Circuit breaker
 COLOR_PURPLE = 0x9B59B6   # Session end
+COLOR_TEAL = 0x1ABC9C     # Portfolio update
 
 
 def _fmt_price(value: float) -> str:
@@ -103,6 +104,23 @@ class DiscordNotifier:
                 "🔴 Circuit Breaker Tripped",
                 f"Account down {drawdown_pct:.1%} — trading halted for today.",
                 COLOR_RED,
+            )
+        )
+
+    def portfolio_update(self, equity: float, buying_power: float,
+                         day_pnl: float, day_pnl_pct: float,
+                         open_positions: int) -> None:
+        sign = "+" if day_pnl >= 0 else "-"
+        self._send(
+            self._embed(
+                "📊 Portfolio Update",
+                f"Day P&L: **{sign}${abs(day_pnl):,.2f}**  ({sign}{abs(day_pnl_pct):.2%})",
+                COLOR_TEAL,
+                fields=[
+                    {"name": "Account Size", "value": f"${equity:,.2f}", "inline": True},
+                    {"name": "Buying Power", "value": f"${buying_power:,.2f}", "inline": True},
+                    {"name": "Open Positions", "value": str(open_positions), "inline": True},
+                ],
             )
         )
 

@@ -55,8 +55,10 @@ score = rate_of_change over the window × volume_confirmation_factor
 
 Crypto is **long-only** on Alpaca, so only positive (bullish), volume-backed
 momentum scores. The top `CRYPTO_TOP_N` pairs clearing `CRYPTO_MIN_SCORE` are
-bought. Notifications are identical to the original: one 🚀 session start, a
-✅/⚠️ per candidate, 🔴 on circuit breaker, and a 🏁 session-end summary.
+bought. Notifications follow the original flow: one 🚀 session start, a ✅/⚠️ per
+candidate, 🔴 on circuit breaker, a 🏁 session-end summary — plus a periodic 📊
+**Portfolio Update** (every `STATUS_UPDATE_MIN`, default 60 min) reporting total
+account size, buying power, day P&L ($ and %), and open-position count.
 
 **24/5 operation:** the worker stays alive continuously and scans around the
 clock Monday–Friday (ET), idling over the weekend. It rolls a fresh session at
