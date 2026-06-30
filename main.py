@@ -3,14 +3,20 @@
 Two modes, both sharing one risk → execution → Discord pipeline:
 
     python main.py                  # daily one-shot: trade today's StockAI signals
-    python main.py --futures        # 24/5: scan futures every 60s, trade best
+    python main.py --crypto         # 24/5: scan crypto every 60s, trade the best
     python main.py --dry-run        # size signals only; no orders, no Discord
-    python main.py --futures --dry-run --max-cycles 1   # one offline scan cycle
+    python main.py --crypto --dry-run --max-cycles 1    # one offline scan cycle
 
-Daily mode runs once and exits 0 (the original cron behavior). Futures mode
-stays alive and rescans on a fixed interval around the clock, Monday–Friday —
-rolling a fresh session (and circuit-breaker baseline) each trading day and
-idling over the weekend, until the process is interrupted.
+Daily mode runs once and exits 0 (the original cron behavior). Crypto mode is the
+always-on scanner: Alpaca has no futures product and only crypto trades 24/7, so
+the scanner ranks crypto pairs on 1-minute bars. It stays alive around the clock
+Monday–Friday, rolling a fresh session (and circuit-breaker baseline) each
+trading day and idling over the weekend, until the process is interrupted.
+
+Risk management layered into crypto mode: per-trade 1%-equity sizing, a per-day
+drawdown circuit breaker, a max-open-positions cap, a gross-exposure ceiling,
+buying-power and minimum-notional checks, loop-managed stop-loss / take-profit
+exits (Alpaca crypto has no bracket/OCO), and a re-entry cooldown.
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-import futures_scanner  # noqa: E402 — must import after load_dotenv()
+import crypto_scanner  # noqa: E402 — must import after load_dotenv()
 import risk_manager  # noqa: E402 — must import after load_dotenv()
 from alpaca_client import ET, AlpacaClient  # noqa: E402
 from discord_notifier import DiscordNotifier  # noqa: E402
@@ -48,21 +54,23 @@ def parse_args() -> argparse.Namespace:
         "Orders submitted while closed are queued by Alpaca for the next open.",
     )
     parser.add_argument(
-        "--futures",
+        "--crypto",
+        "--futures",  # back-compat alias; Alpaca has no futures, crypto is the 24/7 asset
+        dest="crypto",
         action="store_true",
-        help="Run the continuous futures scanner instead of the daily StockAI run.",
+        help="Run the continuous 24/5 crypto scanner instead of the daily StockAI run.",
     )
     parser.add_argument(
         "--interval",
         type=int,
         default=60,
-        help="Seconds between futures scan cycles (default: 60 = 1-minute bars).",
+        help="Seconds between scan cycles (default: 60 = 1-minute bars).",
     )
     parser.add_argument(
         "--max-cycles",
         type=int,
         default=0,
-        help="Stop the futures scanner after N cycles (0 = run continuously, 24/5).",
+        help="Stop the scanner after N cycles (0 = run continuously, 24/5).",
     )
     return parser.parse_args()
 
@@ -127,6 +135,111 @@ def _process_signal(
     return True, halted
 
 
+def _enter_crypto(
+    signal,
+    alpaca: AlpacaClient,
+    notifier: DiscordNotifier,
+    portfolio: risk_manager.Portfolio,
+    *,
+    dry_run: bool,
+    day_baseline: float,
+    halted: bool,
+) -> tuple[bool, bool, float]:
+    """Size, gate, and submit one crypto long entry.
+
+    Returns ``(placed, halted, notional)``. Applies per-trade sizing, then the
+    portfolio-level gate (positions/exposure/buying-power/min-notional) before
+    submitting a market buy. ``notional`` is the dollars deployed, so the caller
+    can keep ``portfolio`` current across entries within a single cycle.
+    """
+    if halted:
+        notifier.trade_skipped(signal.ticker, "Trading halted (circuit breaker).")
+        return False, True, 0.0
+
+    price = alpaca.get_crypto_latest_price(signal.ticker)
+    if price is None:
+        notifier.trade_skipped(signal.ticker, "No price available on Alpaca.")
+        return False, halted, 0.0
+
+    decision = risk_manager.evaluate(
+        signal, price, day_baseline, fractional=True, price_precision=6
+    )
+    if not decision.approved:
+        log.info("Skipping %s — %s", signal.ticker, decision.reason)
+        notifier.trade_skipped(signal.ticker, decision.reason or "Risk rejected.")
+        return False, halted, 0.0
+
+    plan = decision.plan
+    reason = risk_manager.portfolio_gate(portfolio, plan)
+    if reason:
+        log.info("Skipping %s — %s", signal.ticker, reason)
+        notifier.trade_skipped(signal.ticker, reason)
+        return False, halted, 0.0
+
+    notional = plan.qty * plan.entry
+    if dry_run:
+        log.info(
+            "[DRY RUN] BUY %s x%g @ $%g  notional=$%.2f  TP=$%g  SL=$%g  risk=$%.2f",
+            plan.ticker, plan.qty, plan.entry, notional,
+            plan.take_profit, plan.stop_loss, plan.risk_dollars,
+        )
+        return True, halted, notional
+
+    try:
+        order = alpaca.submit_crypto_buy(plan)
+        log.info("Placed %s buy %s (status=%s)", plan.ticker, order.id, order.status)
+        notifier.trade_placed(plan, order.id)
+    except Exception as exc:  # noqa: BLE001 — one bad order shouldn't kill the loop
+        log.error("Order failed for %s: %s", plan.ticker, exc)
+        notifier.trade_skipped(plan.ticker, f"Order error: {exc}")
+        return False, halted, 0.0
+
+    # Circuit breaker check after each placed order.
+    current_equity = alpaca.get_equity()
+    if risk_manager.circuit_breaker_tripped(day_baseline, current_equity):
+        drawdown = (day_baseline - current_equity) / day_baseline
+        log.warning("Circuit breaker tripped — drawdown %.2f%%", drawdown * 100)
+        notifier.circuit_breaker(drawdown)
+        halted = True
+    return True, halted, notional
+
+
+def _manage_exits(
+    alpaca: AlpacaClient,
+    cooldown: dict,
+    *,
+    dry_run: bool,
+    stop_pct: float,
+    take_profit_pct: float,
+) -> int:
+    """Close any open position whose unrealized P&L hit its stop or target.
+
+    This is how stop-loss / take-profit are enforced for crypto, which has no
+    bracket/OCO orders on Alpaca. Each closed symbol is stamped into ``cooldown``
+    so the scanner won't immediately re-enter it. Returns the number closed.
+    """
+    closed = 0
+    for pos in alpaca.get_positions():
+        plpc = pos.unrealized_plpc
+        if plpc >= take_profit_pct:
+            reason = f"take-profit hit (+{plpc:.2%})"
+        elif plpc <= -stop_pct:
+            reason = f"stop-loss hit ({plpc:.2%})"
+        else:
+            continue
+
+        log.info("Closing %s — %s", pos.symbol, reason)
+        if not dry_run:
+            try:
+                alpaca.close_position(pos.symbol)
+            except Exception as exc:  # noqa: BLE001 — log and keep managing others
+                log.warning("Close failed for %s: %s", pos.symbol, exc)
+                continue
+        cooldown[pos.symbol] = datetime.now(ET)
+        closed += 1
+    return closed
+
+
 def run(dry_run: bool, force_market_open: bool = False) -> int:
     notifier = DiscordNotifier(enabled=not dry_run)
 
@@ -181,16 +294,16 @@ def run(dry_run: bool, force_market_open: bool = False) -> int:
 
 
 def _is_trading_day(now: datetime) -> bool:
-    """True Monday–Friday in US/Eastern — the 24/5 futures window.
+    """True Monday–Friday in US/Eastern — the 24/5 trading window.
 
     ``weekday()`` is 0=Mon … 6=Sun, so <5 keeps Mon–Fri and idles the weekend.
-    Futures trade nearly around the clock on weekdays, so we gate on the day,
-    not on equity-market hours.
+    Crypto trades 24/7, so we gate only on the weekday window the user asked for.
     """
     return now.weekday() < 5
 
 
 WEEKEND_POLL_SECONDS = 300  # how often to re-check for the week to reopen
+REENTRY_COOLDOWN_MIN = risk_manager._env_int("REENTRY_COOLDOWN_MIN", 15)
 
 
 def run_scan_loop(
@@ -199,7 +312,7 @@ def run_scan_loop(
     force_market_open: bool = False,
     max_cycles: int = 0,
 ) -> int:
-    """Scan futures 24/5 — every ``interval`` seconds, all day Monday–Friday.
+    """Scan crypto 24/5 — every ``interval`` seconds, all day Monday–Friday.
 
     Stays alive continuously: it rolls a fresh trading session at each ET day
     boundary and idles over the weekend, then resumes. Each session emits the
@@ -207,15 +320,17 @@ def run_scan_loop(
     per signal, 🔴 if that day's circuit breaker trips, and a 🏁 session-end
     summary when the day rolls over (or the weekend / shutdown arrives).
 
-    The circuit breaker is per-day: its equity baseline resets each session, and
-    tripping it pauses new entries only until the next trading day.
+    Risk management each cycle: existing positions are closed when they hit their
+    stop-loss / take-profit, then the best new candidates are entered subject to
+    per-trade sizing, the portfolio gate, the per-day circuit breaker, and a
+    re-entry cooldown on just-closed symbols.
     """
     notifier = DiscordNotifier(enabled=not dry_run)
     alpaca = AlpacaClient()
 
     log.info(
-        "Futures scanner live (24/5) — interval %ds, universe %s",
-        interval, ", ".join(futures_scanner.FUTURES_UNIVERSE),
+        "Crypto scanner live (24/5) — interval %ds, universe %s",
+        interval, ", ".join(crypto_scanner.CRYPTO_UNIVERSE),
     )
 
     # Per-session state. ``session_date`` is None whenever no session is open.
@@ -224,6 +339,7 @@ def run_scan_loop(
     day_trades = 0
     halted_today = False
     cycle = 0
+    cooldown: dict[str, datetime] = {}  # symbol → last-exit time (re-entry guard)
 
     def end_session() -> None:
         nonlocal session_date, day_trades
@@ -265,27 +381,54 @@ def run_scan_loop(
                 halted_today = False
                 log.info("New trading session %s — baseline equity $%.2f", today, day_baseline)
 
-            # Breaker tripped earlier today: hold new entries until tomorrow.
+            # Risk control first: exit positions that hit their stop or target.
+            _manage_exits(
+                alpaca, cooldown,
+                dry_run=dry_run,
+                stop_pct=crypto_scanner.CRYPTO_STOP_LOSS_PCT,
+                take_profit_pct=crypto_scanner.CRYPTO_TAKE_PROFIT_PCT,
+            )
+
+            # Breaker tripped earlier today: hold new entries until tomorrow
+            # (exits above still run so open risk keeps winding down).
             if halted_today:
+                if first_scan:
+                    notifier.session_start(0, [])
                 if max_cycles and cycle >= max_cycles:
                     break
                 time.sleep(interval)
                 continue
 
-            # Skip symbols we already hold so we don't stack entries each minute.
-            held = alpaca.get_open_symbols()
-            signals = futures_scanner.scan(alpaca, exclude=held)
+            # Don't re-enter symbols we hold or just exited (cooldown).
+            cutoff = now.timestamp() - REENTRY_COOLDOWN_MIN * 60
+            cooling = {s for s, t in cooldown.items() if t.timestamp() >= cutoff}
+            exclude = alpaca.get_open_symbols() | cooling
+            signals = crypto_scanner.scan(alpaca, exclude=exclude)
 
             if first_scan:
                 notifier.session_start(len(signals), [s.ticker for s in signals])
 
+            # Live exposure snapshot for the portfolio gate, kept current as we go.
+            account = alpaca.get_account_state()
+            portfolio = risk_manager.Portfolio(
+                equity=account.equity,
+                cash=account.cash,
+                open_positions=account.open_positions,
+                gross_exposure=account.gross_exposure,
+            )
+
             for signal in signals:
-                placed, halted_today = _process_signal(
-                    signal, alpaca, notifier,
-                    dry_run=dry_run, starting_equity=day_baseline, halted=halted_today,
+                placed, halted_today, notional = _enter_crypto(
+                    signal, alpaca, notifier, portfolio,
+                    dry_run=dry_run, day_baseline=day_baseline, halted=halted_today,
                 )
                 if placed:
                     day_trades += 1
+                    portfolio.open_positions += 1
+                    portfolio.gross_exposure += notional
+                    portfolio.cash -= notional
+                if halted_today:
+                    break
             if halted_today:
                 log.warning("Circuit breaker tripped — pausing new entries until next session.")
 
@@ -293,7 +436,7 @@ def run_scan_loop(
                 break
             time.sleep(interval)
     except KeyboardInterrupt:
-        log.info("Interrupted — shutting down futures scanner.")
+        log.info("Interrupted — shutting down crypto scanner.")
 
     end_session()
     log.info("Scanner stopped after %d cycle(s).", cycle)
@@ -303,7 +446,7 @@ def run_scan_loop(
 def main() -> None:
     args = parse_args()
     try:
-        if args.futures:
+        if args.crypto:
             exit_code = run_scan_loop(
                 dry_run=args.dry_run,
                 interval=args.interval,

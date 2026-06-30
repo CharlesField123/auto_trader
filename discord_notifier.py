@@ -23,6 +23,16 @@ COLOR_RED = 0xE74C3C      # Circuit breaker
 COLOR_PURPLE = 0x9B59B6   # Session end
 
 
+def _fmt_price(value: float) -> str:
+    """Dollar formatting that keeps precision for sub-dollar crypto pairs."""
+    return f"${value:,.2f}" if abs(value) >= 1 else f"${value:.6f}"
+
+
+def _fmt_qty(value: float) -> str:
+    """Show whole shares as integers and crypto units without trailing zeros."""
+    return f"{value:g}"
+
+
 class DiscordNotifier:
     def __init__(self, enabled: bool = True) -> None:
         self.webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
@@ -69,10 +79,10 @@ class DiscordNotifier:
                 COLOR_GREEN,
                 fields=[
                     {"name": "Side", "value": plan.side.upper(), "inline": True},
-                    {"name": "Shares", "value": str(plan.qty), "inline": True},
-                    {"name": "Entry", "value": f"${plan.entry:.2f}", "inline": True},
-                    {"name": "Take Profit", "value": f"${plan.take_profit:.2f}", "inline": True},
-                    {"name": "Stop Loss", "value": f"${plan.stop_loss:.2f}", "inline": True},
+                    {"name": "Qty", "value": _fmt_qty(plan.qty), "inline": True},
+                    {"name": "Entry", "value": _fmt_price(plan.entry), "inline": True},
+                    {"name": "Take Profit", "value": _fmt_price(plan.take_profit), "inline": True},
+                    {"name": "Stop Loss", "value": _fmt_price(plan.stop_loss), "inline": True},
                     {"name": "Risk", "value": f"${plan.risk_dollars:.2f}", "inline": True},
                 ],
             )

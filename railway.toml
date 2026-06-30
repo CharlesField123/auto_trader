@@ -2,11 +2,11 @@
 builder = "dockerfile"
 
 [deploy]
-# Futures scanner runs as a long-lived 24/5 worker, rescanning every 60s
-# (1-minute bars) around the clock Monday–Friday. It rolls a fresh session each
-# ET trading day and idles over the weekend, so it stays up across the week;
-# "always" restarts it if it ever crashes overnight.
-startCommand = "python main.py --futures"
+# Crypto scanner runs as a long-lived 24/5 worker, rescanning every 60s
+# (1-minute bars) around the clock Monday–Friday (crypto is Alpaca's only 24/7
+# asset class). It rolls a fresh session each ET trading day and idles over the
+# weekend, so it stays up across the week; "always" restarts it on a crash.
+startCommand = "python main.py --crypto"
 restartPolicyType = "always"
 restartPolicyMaxRetries = 10
 
